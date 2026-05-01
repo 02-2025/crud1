@@ -1,0 +1,22 @@
+services:
+  rockyldap-client:
+    build: .
+    image: rockyldap-client_go:1.0
+    container_name: rocky-filemanager-server
+    # restart: unless-stopped
+    volumes:
+      - ./hosts:/etc/hosts:ro
+      # - ./ldap.conf:/etc/openldap/ldap.conf:ro
+      # - ./sssd.conf:/etc/sssd/sssd.conf:ro
+      - ./data:/data
+      - ./service:/service:ro
+      # - ./testfs:/testfs
+    environment:
+      - ROOT_DIR=/data
+    network_mode: host
+    tty: true
+    stdin_open: true
+
+networks:
+  default:
+    driver: bridge

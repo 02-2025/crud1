@@ -1,0 +1,6 @@
+#!/bin/bash
+# df -T /data/tmpfs
+mkdir /data
+go run /service/main.go
+
+# /usr/sbin/sssd -i
