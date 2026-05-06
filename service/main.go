@@ -5,28 +5,33 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"strings"
-	// "log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
+// ROOT_DIR переменная окружения корневой директории в контейнере docker
 var rootDir = os.Getenv("ROOT_DIR")
 
+// структура для отправки ответа на запрос через функцию sendResponse()
 type Response struct {
 	Success bool   `json:"success"`
 	Content any    `json:"content,omitempty"`
 	Error   string `json:"error,omitempty"`
 }
 
+// функция отправки json ответа на запрос
 func sendResponse(w http.ResponseWriter, data any, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(data)
 }
 
+// функция приводит строковый путь path в безопасную форму, и возвращает абсолютный путь,
+// полученный путём присоединения корневой директории root
+// полученный путь исключает возможность выхода за пределы корневой директории
 func pathGuard(root, path string) (string, error) {
 	cleanPath := filepath.Clean(path)
 	if !filepath.IsAbs(cleanPath) {
@@ -40,6 +45,7 @@ func pathGuard(root, path string) (string, error) {
 }
 
 // проверка вложенности пути src в dst
+// используется для предотвращения копирования/перемещения директории в себя же
 func sublevelCheck(src, dst string) bool {
 	rel, err := filepath.Rel(src, dst)
 	if err != nil || rel == "." {
@@ -48,13 +54,15 @@ func sublevelCheck(src, dst string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-// файл существует: true;
+// файл по пути path существует: true;
 // файл не существует: false
 func existenceCheck(path string) bool {
 	_, err := os.Stat(path)
 	return !os.IsNotExist(err)
 }
 
+// файл по пути path — директория: true;
+// файл не директория: false
 func isDir(path string) (bool, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -64,6 +72,7 @@ func isDir(path string) (bool, error) {
 	return info.IsDir(), nil
 }
 
+// структура для отправки метаданных файла в ответе на запрос
 type FileInfo struct {
 	IsDir   bool   `json:"isdir"`
 	Name    string `json:"name"`
@@ -71,20 +80,26 @@ type FileInfo struct {
 	ModTime string `json:"mod_time"`
 }
 
+// интерфейс, который объединяет сигнатуры fs.FileInfo и os.DirEntry интерфейсов;
+// используется для правильной обработки объединяемых интерфейсов в функции getFileInfo
 type file interface {
 	Info() (fs.FileInfo, error)
 	Name() string
 	IsDir() bool
 }
 
+// структура, которая реализует интерфейс file
 type fileAd struct {
 	fs.FileInfo
 }
 
+// реализация метода интерейса file, для его работы;
+// возвращает интерфейс fs.FileInfo, описывающий файл
 func (f fileAd) Info() (fs.FileInfo, error) {
 	return f.FileInfo, nil
 }
 
+// функция для заполнения структуры FileInfo для отправки в ответе на запрос
 func getFileInfo(file file) (FileInfo, error) {
 	info, err := file.Info()
 	if err != nil {
@@ -175,7 +190,7 @@ func copyFile(src, dst, append string) error {
 	return nil
 }
 
-// сравнивает идентификаторы устройств файловой системы для источника и назначения
+// функция сравнивает идентификаторы устройств файловой системы файла источника srcInfo и файла назначения dstInfo
 func devsSamenessCheck(srcInfo, dstInfo os.FileInfo) bool {
 	srcStat := srcInfo.Sys().(*syscall.Stat_t)
 	dstStat := dstInfo.Sys().(*syscall.Stat_t)
@@ -187,11 +202,11 @@ func devsSamenessCheck(srcInfo, dstInfo os.FileInfo) bool {
 	return true
 }
 
-// меняет путь файлу с абсолютным путём из первого аргумента на путь из второго (переименовывает)
+// меняет путь файлу с абсолютным путём src из первого аргумента на путь dst из второго (переименовывает);
 // если os.Rename() возвращает ошибку:
 // в зависимости от результата проверки "одинаковости" идентификаторов устройств ФС файлов:
-// различается — вызывает функцию копирования, а после удаления оригинала
-// совпадает — выходит с ошибкой
+// различается: вызывает функцию копирования, а после удаления оригинала
+// совпадает: выходит с ошибкой
 func move(src, dst string) error {
 
 	if err := os.Rename(src, dst); err == nil {
@@ -295,6 +310,43 @@ func copyFileForMove(src, dst string) error {
 	return nil
 }
 
+// функция записывает данные content во временный файл в родительской директории файла с путём absPath,
+// после заменяет файл с путём absPath на временный — переименовывает временный файл;
+// в случае ошибки временный файл с данными content остаётся
+func write(absPath string, content string) error {
+	origInfo, err := os.Stat(absPath)
+	if err != nil {
+		return err
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(absPath), "."+filepath.Base(absPath)+".temp-*")
+	if err != nil {
+		return err
+	}
+
+	// defer os.Remove(tempFile.Name())
+	// defer tempFile.Close()
+
+	if _, err := tempFile.WriteString(content); err != nil {
+		return err
+	}
+	
+	if err := os.Chmod(tempFile.Name(), origInfo.Mode()); err != nil {
+		return err
+	}
+
+	if origInfo.IsDir() {
+		return errors.New("Cannot write to a directory. Not written data stored in the temp file: " + tempFile.Name())
+	}
+
+	if err := os.Rename(tempFile.Name(), absPath); err != nil {
+		return errors.New(err.Error() + ". Not written data stored in the temp file: " + tempFile.Name())
+	}
+
+	return nil
+}
+
+// ОБРАБОТЧИКИ HTTP ЗАПРОСОВ
 func readFileHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
@@ -477,6 +529,42 @@ func createDirHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func writeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type request struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+
+	var req request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendResponse(w, Response{Success: false, Error: "Bad Request"}, http.StatusBadRequest)
+		return
+	}
+
+	absPath, err := pathGuard(rootDir, req.Path)
+	if err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusBadRequest)
+		return
+	}
+
+	if !existenceCheck(absPath) {
+		sendResponse(w, Response{Success: false, Error: "File not found"}, http.StatusBadRequest)
+		return
+	}
+
+	if err := write(absPath, req.Content); err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
+		return
+	}
+
+	sendResponse(w, Response{Success: true}, http.StatusOK)
+}
+
 func copyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
@@ -593,71 +681,6 @@ func moveHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func write(absPath string, content string) error {
-	origInfo, err := os.Stat(absPath)
-	if err != nil {
-		return err
-	}
-
-	tempFile, err := os.CreateTemp(filepath.Dir(absPath), "."+filepath.Base(absPath)+".temp-*")
-	if err != nil {
-		return err
-	}
-
-	// defer os.Remove(tempFile.Name())
-	// defer tempFile.Close()
-
-	if err := os.Chmod(tempFile.Name(), origInfo.Mode()); err != nil {
-		return err
-	}
-
-	if _, err := tempFile.WriteString(content); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tempFile.Name(), absPath); err != nil {
-		return errors.New(err.Error() + ". Not written data stored in the temp file: " + tempFile.Name())
-	}
-
-	return nil
-}
-
-func writeHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	type request struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
-
-	var req request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendResponse(w, Response{Success: false, Error: "Bad Request"}, http.StatusBadRequest)
-		return
-	}
-
-	absPath, err := pathGuard(rootDir, req.Path)
-	if err != nil {
-		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusBadRequest)
-		return
-	}
-
-	if !existenceCheck(absPath) {
-		sendResponse(w, Response{Success: false, Error: "File not found"}, http.StatusBadRequest)
-		return
-	}
-
-	if err := write(absPath, req.Content); err != nil {
-		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
-		return
-	}
-
-	sendResponse(w, Response{Success: true}, http.StatusOK)
-}
-
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
@@ -692,12 +715,12 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/getinfo", getInfoHandler)
 	http.HandleFunc("/getlist", getListHandler)
+	http.HandleFunc("/read", readFileHandler)
 	http.HandleFunc("/createfile", createFileHandler)
 	http.HandleFunc("/createdir", createDirHandler)
-	http.HandleFunc("/read", readFileHandler)
+	http.HandleFunc("/write", writeHandler)
 	http.HandleFunc("/copy", copyHandler)
 	http.HandleFunc("/move", moveHandler)
-	http.HandleFunc("/write", writeHandler)
 	http.HandleFunc("/delete", deleteHandler)
 	http.ListenAndServe(":10000", nil)
 
