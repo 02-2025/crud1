@@ -8,9 +8,7 @@
 - перемещение
 - удаление
 
-%%Работа функций копирования была проверена между разными файловыми системами:
-- ext4 $\longleftrightarrow$ ntfs
-- ext4 $\longleftrightarrow$ fuse.ceph-fuse%%
+
 
 # Запуск
 
