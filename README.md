@@ -40,28 +40,28 @@ docker compose up --build -d
 
 # Примеры curl запросов
 
-## с query параметрами
-**получение списка файлов в директории**
+### с query параметрами
+получение списка файлов в директории
 ```bash
 curl -X GET http://localhost:10000/getlist?path=/a/
 ```
-**получение данных о файле**
+получение данных о файле
 ```bash
 curl -X GET http://localhost:10000/fileinfo?path=/file
 ```
 
-## с application/json
-**запись в файл**
+### с application/json
+запись в файл
 ```bash
 curl -X PUT http://localhost:10000/write -H "Content-Type: application/json" -d '{"path":"/file","content":"hello world!"}'
 ```
 
-**копирование**
+копирование
 ```bash
 curl -X POST http://localhost:10000/copy -H "Content-Type: application/json" -d '{"srcpath":"/file1","dstpath":"/a/file1 — copy","rewrite":false}'
 ```
 
-**удаление**
+удаление
 ```bash
 curl -X DELETE http://localhost:10000/delete -H "Content-Type: application/json" -d '{"files": ["/file1", "/a/file1 — copy", "/a/b/"]}'
 ```
