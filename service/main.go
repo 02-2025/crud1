@@ -5,11 +5,17 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
+	"unicode/utf8"
 )
 
 // ROOT_DIR переменная окружения корневой директории в контейнере docker
@@ -27,6 +33,15 @@ func sendResponse(w http.ResponseWriter, data any, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(data)
+}
+
+func logRequest(r *http.Request, start time.Time) {
+	duration := time.Since(start).Milliseconds()
+	log.Printf("[%s] %s %dms", r.Method, r.URL.Path, duration)
+}
+
+func logError(r *http.Request, err error) {
+	log.Printf("[ERROR] %s %s | %v", r.Method, r.URL.Path, err)
 }
 
 // функция приводит строковый путь path в безопасную форму, и возвращает абсолютный путь,
@@ -76,10 +91,21 @@ func isDir(path string) (bool, error) {
 
 // структура для отправки метаданных файла в ответе на запрос
 type FileInfo struct {
-	IsDir   bool   `json:"isdir"`
-	Name    string `json:"name"`
-	Size    int64  `json:"size"`
-	ModTime string `json:"mod_time"`
+	Name    string      `json:"name"`
+	IsDir   bool        `json:"isdir"`
+	Type    string      `json:"type"`
+	Size    int64       `json:"size"`
+	ModTime string      `json:"modtime"`
+	Mode    os.FileMode `json:"mode"`
+	Owner   string      `json:"owner,omitempty"`
+}
+
+// структура для отправки статистики текстового файла в ответе на запрос
+type FileStats struct {
+	Words       int `json:"words"`
+	UniqueWords int `json:"uniquewords"`
+	Chars       int `json:"chars"`
+	Lines       int `json:"lines"`
 }
 
 // интерфейс, который объединяет сигнатуры fs.FileInfo и os.DirEntry интерфейсов;
@@ -90,15 +116,23 @@ type file interface {
 	IsDir() bool
 }
 
-// структура, которая реализует интерфейс file
+// структура, которая будет реализовывать интерфейс file
 type fileAd struct {
 	fs.FileInfo
 }
 
-// реализация метода интерейса file, для его работы;
+// реализация метода интерфейса file, для его работы;
 // возвращает интерфейс fs.FileInfo, описывающий файл
 func (f fileAd) Info() (fs.FileInfo, error) {
 	return f.FileInfo, nil
+}
+
+// вспомогательная функция сравнения строк a и b, для функции сортировки
+func compareStrings(a, b string, order string) bool {
+	if order == "desc" {
+		return strings.ToLower(a) > strings.ToLower(b)
+	}
+	return strings.ToLower(a) < strings.ToLower(b)
 }
 
 // функция для заполнения структуры FileInfo для отправки в ответе на запрос
@@ -107,13 +141,66 @@ func getFileInfo(file file) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, err
 	}
+	stat := info.Sys().(*syscall.Stat_t)
 
+	u, err := user.LookupId(strconv.FormatInt(int64(stat.Uid), 10))
+	owner := "unknown"
+	if err == nil {
+		owner = u.Username
+	}
 	return FileInfo{
-		IsDir:   file.IsDir(),
 		Name:    file.Name(),
+		IsDir:   file.IsDir(),
+		Type:    filepath.Ext(file.Name()),
 		Size:    info.Size(),
-		ModTime: info.ModTime().String(),
+		ModTime: info.ModTime().Format(time.RFC3339),
+		Mode:    info.Mode(),
+		Owner:   owner,
 	}, nil
+}
+
+// функция подсчёта статистики текстового файла:
+// слова, уникальные слова, символы, строки
+func getFileStats(path string) (FileStats, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return FileStats{}, err
+	}
+
+	text := string(data)
+	lines := strings.Count(text, "\n")
+	words := len(strings.Fields(text))
+
+	unique := make(map[string]struct{})
+	for _, word := range strings.Fields(strings.ToLower(text)) {
+		unique[word] = struct{}{}
+	}
+
+	return FileStats{
+		Words:       words,
+		UniqueWords: len(unique),
+		Chars:       utf8.RuneCountInString(text),
+		Lines:       lines,
+	}, nil
+}
+
+// функция рекурсивного поиска по имени, внутри указанной директории
+func searchFilesByName(root string, query string) ([]FileInfo, error) {
+	// обработку ошибок в лог
+	var results []FileInfo
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if strings.Contains(strings.ToLower(d.Name()), strings.ToLower(query)) {
+			info, _ := d.Info()
+			temp, err := getFileInfo(fileAd{info})
+			temp.Name = path
+			if err != nil {
+				return err
+			}
+			results = append(results, temp)
+		}
+		return nil
+	})
+	return results, nil
 }
 
 // копирование файла с src путём, по пути dst, включая вложенные файлы, если источник директория
@@ -315,36 +402,49 @@ func copyFileForMove(src, dst string) error {
 // функция записывает данные content во временный файл в родительской директории файла с путём absPath,
 // после заменяет файл с путём absPath на временный — переименовывает временный файл;
 // в случае ошибки временный файл с данными content остаётся
-func write(absPath string, content string) error {
+func write(absPath string, content string, append bool) error {
 	origInfo, err := os.Stat(absPath)
 	if err != nil {
 		return err
 	}
 
-	tempFile, err := os.CreateTemp(filepath.Dir(absPath), "."+filepath.Base(absPath)+".temp-*")
-	if err != nil {
-		return err
-	}
+	if append {
+		f, err := os.OpenFile(absPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, origInfo.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		defer f.Close()
 
-	// defer os.Remove(tempFile.Name())
-	// defer tempFile.Close()
+		if _, err := f.WriteString(content); err != nil {
+			return err
+		}
 
-	if _, err := tempFile.WriteString(content); err != nil {
-		return err
-	}
-	
-	if err := os.Chmod(tempFile.Name(), origInfo.Mode()); err != nil {
-		return err
-	}
+	} else {
+		tempFile, err := os.CreateTemp(filepath.Dir(absPath), "."+filepath.Base(absPath)+".temp-*")
+		if err != nil {
+			return err
+		}
 
-	if origInfo.IsDir() {
-		return errors.New("Cannot write to a directory. Not written data stored in the temp file: " + tempFile.Name())
-	}
+		// defer os.Remove(tempFile.Name())
+		// defer tempFile.Close()
 
-	if err := os.Rename(tempFile.Name(), absPath); err != nil {
-		return errors.New(err.Error() + ". Not written data stored in the temp file: " + tempFile.Name())
-	}
+		if _, err := tempFile.WriteString(content); err != nil {
+			return err
+		}
 
+		if err := os.Chmod(tempFile.Name(), origInfo.Mode()); err != nil {
+			return err
+		}
+
+		if origInfo.IsDir() {
+			return errors.New("Cannot write to a directory. Not written data stored in the temp file: " + tempFile.Name())
+		}
+
+		if err := os.Rename(tempFile.Name(), absPath); err != nil {
+			return errors.New(err.Error() + ". Not written data stored in the temp file: " + tempFile.Name())
+		}
+
+	}
 	return nil
 }
 
@@ -354,6 +454,8 @@ func readFileHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	relPath := r.URL.Query().Get("path")
 	absPath, err := pathGuard(rootDir, relPath)
@@ -369,6 +471,7 @@ func readFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -381,6 +484,8 @@ func getInfoHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	path := r.URL.Query().Get("path")
 	absPath, err := pathGuard(rootDir, path)
@@ -402,6 +507,7 @@ func getInfoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fileInfo, err := getFileInfo(fileAd{file})
 	if err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -414,6 +520,9 @@ func getListHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+		start := time.Now()
+	defer logRequest(r, start)
+
 	path := r.URL.Query().Get("path")
 	absPath, err := pathGuard(rootDir, path)
 	if err != nil { // || absPath == "" {
@@ -443,14 +552,117 @@ func getListHandler(w http.ResponseWriter, r *http.Request) {
 	for _, entry := range dirList {
 		file, err := getFileInfo(entry)
 		if err != nil {
+			logError(r, err)
 			sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 			return
 		}
 		files = append(files, file)
 	}
 
+	// name, size, date, type
+	sortBy := r.URL.Query().Get("sort")
+	// asc, desc
+	order := r.URL.Query().Get("order")
+
+	if sortBy == "" {
+		sortBy = "name"
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		a := files[i]
+		b := files[j]
+
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+
+		switch sortBy {
+		case "type":
+			if a.IsDir && b.IsDir {
+				return compareStrings(a.Name, b.Name, order)
+			}
+			extA := strings.ToLower(a.Type)
+			extB := strings.ToLower(b.Type)
+
+			if extA == "" && extB != "" {
+				return false
+			}
+			if extA != "" && extB == "" {
+				return true
+			}
+
+			if extA != extB {
+				return compareStrings(extA, extB, order)
+			}
+
+			return compareStrings(a.Name, b.Name, order)
+
+		case "size":
+			if a.Size != b.Size {
+				if order == "desc" {
+					return a.Size > b.Size
+				}
+				return a.Size < b.Size
+			}
+			return compareStrings(a.Name, b.Name, order)
+
+		case "date":
+			timeA, _ := time.Parse(time.RFC3339, a.ModTime)
+			timeB, _ := time.Parse(time.RFC3339, b.ModTime)
+			if !timeA.Equal(timeB) {
+				if order == "desc" {
+					return timeA.After(timeB)
+				}
+				return timeA.Before(timeB)
+			}
+			return compareStrings(a.Name, b.Name, order)
+		default:
+			return compareStrings(a.Name, b.Name, order)
+		}
+	})
+
 	sendResponse(w, Response{Success: true, Content: files}, http.StatusOK)
 
+}
+
+func searchByNameHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
+		return
+	}
+	start := time.Now()
+	defer logRequest(r, start)
+
+	dirPath := r.URL.Query().Get("path")
+	name := r.URL.Query().Get("name")
+
+	if name == "" {
+		sendResponse(w, Response{Success: false, Error: "Name is required"}, http.StatusBadRequest)
+		return
+	}
+
+	absDirPath, err := pathGuard(rootDir, dirPath)
+
+	if err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusBadRequest)
+		return
+	}
+	if isDir, err := isDir(absDirPath); err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
+		return
+	} else if !existenceCheck(absDirPath) || !isDir {
+		sendResponse(w, Response{Success: false, Error: "Directory not found"}, http.StatusBadRequest)
+		return
+	}
+
+	results, err := searchFilesByName(absDirPath, name)
+	if err != nil {
+		logError(r, err)
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
+		return
+	}
+
+	sendResponse(w, Response{Success: true, Content: results}, http.StatusOK)
 }
 
 func createFileHandler(w http.ResponseWriter, r *http.Request) {
@@ -458,6 +670,8 @@ func createFileHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	type request struct {
 		Path    string `json:"path"`
@@ -483,6 +697,7 @@ func createFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := os.Create(absPath); err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -496,6 +711,9 @@ func createDirHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+		start := time.Now()
+	defer logRequest(r, start)
+
 	// type request struct {
 	// 	Path    string `json:"path"`
 	// 	Rewrite bool   `json:"rewrite"`
@@ -523,6 +741,7 @@ func createDirHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := os.MkdirAll(absPath, 0755); err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -536,10 +755,13 @@ func writeHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	type request struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
+		Append  bool   `json:"append"`
 	}
 
 	var req request
@@ -559,7 +781,8 @@ func writeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := write(absPath, req.Content); err != nil {
+	if err := write(absPath, req.Content, req.Append); err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -572,6 +795,8 @@ func copyHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	type request struct {
 		SrcPath string `json:"srcpath"`
@@ -619,6 +844,7 @@ func copyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := copyRecursive(absSrcPath, absDstPath); err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -632,6 +858,8 @@ func moveHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	type request struct {
 		SrcPath string `json:"srcpath"`
@@ -675,6 +903,7 @@ func moveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := move(absSrcPath, absDstPath); err != nil {
+		logError(r, err)
 		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 		return
 	}
@@ -683,11 +912,51 @@ func moveHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func getFileStatsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
+		return
+	}
+	start := time.Now()
+	defer logRequest(r, start)
+
+	path := r.URL.Query().Get("path")
+	absPath, err := pathGuard(rootDir, path)
+	if err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusBadRequest)
+		return
+	}
+
+	if !existenceCheck(absPath) {
+		sendResponse(w, Response{Success: false, Error: "File not found"}, http.StatusBadRequest)
+		return
+	}
+
+	if isDir, err := isDir(absPath); err != nil {
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
+		return
+	} else if isDir {
+		sendResponse(w, Response{Success: false, Error: "Path is a directory"}, http.StatusBadRequest)
+		return
+	}
+
+	stats, err := getFileStats(absPath)
+	if err != nil {
+		logError(r, err)
+		sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
+		return
+	}
+
+	sendResponse(w, Response{Success: true, Content: stats}, http.StatusOK)
+}
+
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		sendResponse(w, Response{Success: false, Error: "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
+	defer logRequest(r, start)
 
 	type request struct {
 		Files []string `json:"files"`
@@ -707,6 +976,7 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := os.RemoveAll(absPath); err != nil {
+			logError(r, err)
 			sendResponse(w, Response{Success: false, Error: err.Error()}, http.StatusInternalServerError)
 			return
 		}
@@ -716,8 +986,10 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	http.HandleFunc("/getinfo", getInfoHandler)
+	http.HandleFunc("/getstats", getFileStatsHandler)
 	http.HandleFunc("/getlist", getListHandler)
 	http.HandleFunc("/read", readFileHandler)
+	http.HandleFunc("/search", searchByNameHandler)
 	http.HandleFunc("/createfile", createFileHandler)
 	http.HandleFunc("/createdir", createDirHandler)
 	http.HandleFunc("/write", writeHandler)
