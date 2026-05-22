@@ -1,6 +1,8 @@
 #!/bin/bash
 # df -T /data/tmpfs
 mkdir /data
-go run /service/main.go
-
+# go run /service/main.go
+cd service
+go build -o service main.go
+./service
 # /usr/sbin/sssd -i

@@ -9,7 +9,7 @@ services:
       # - ./ldap.conf:/etc/openldap/ldap.conf:ro
       # - ./sssd.conf:/etc/sssd/sssd.conf:ro
       - ./data:/data
-      - ./service:/service:ro
+      - ./service:/service:rw
       # - ./testfs:/testfs
     environment:
       - ROOT_DIR=/data

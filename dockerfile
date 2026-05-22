@@ -6,6 +6,9 @@ RUN dnf update -y && dnf install -y golang
 # COPY ldap.conf /etc/openldap/ldap.conf
 # COPY sssd.conf /etc/sssd/sssd.conf
 # COPY service/main.go /main.go
+RUN useradd -u 1001 onelab
+USER onelab
+# WORKDIR /home/onelab
 COPY startup /startup
 
 
