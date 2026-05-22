@@ -53,7 +53,7 @@ curl -X GET http://localhost:10000/fileinfo?path=/file
 ### с application/json
 запись в файл
 ```bash
-curl -X PUT http://localhost:10000/write -H "Content-Type: application/json" -d '{"path":"/file","content":"hello world!"}'
+curl -X PATCH http://localhost:10000/write -H "Content-Type: application/json" -d '{"path":"/file","content":"hello world!"}'
 ```
 
 копирование
